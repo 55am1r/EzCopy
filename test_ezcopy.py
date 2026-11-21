@@ -184,6 +184,49 @@ try:
     assert kind in ("hdd", "ssd", "network", None), kind
     print(f"drive kind of {tmp}: {kind}")
 
+    # 11. speed test: measures every part, leaves no test files, copies nothing, cancels cleanly
+    card, out = os.path.join(tmp, "card"), os.path.join(tmp, "st-out")
+    os.makedirs(os.path.join(card, "DCIM"))
+    os.makedirs(out)
+    for i, n in enumerate((3 * B + 5, B, 4096, 1)):
+        open(os.path.join(card, "DCIM", f"IMG_{i}.CR3"), "wb").write(os.urandom(n))
+    open(os.path.join(card, "empty.txt"), "wb").close()
+    for ver in (True, False):
+        r = ezcopy.speed_test([card], out, verify=ver, seconds=0.5, max_bytes=64 << 20)
+        assert r.read > 0 and r.write > 0 and r.cpu > 0 and r.speed > 0, r
+        assert (r.readback > 0) == ver, r
+        assert r.files == 4 and r.total == 4 * B + 4102, r
+        assert r.limit and r.speed <= max(r.read, r.write, 2 * r.cpu), r
+        assert os.listdir(out) == [], os.listdir(out)          # test files deleted, nothing copied
+        text = "\n".join(ezcopy.speed_lines(r))
+        assert "should copy" in text and ("Reading back" in text) == ver, text
+    print("\n".join(ezcopy.speed_lines(r)))
+    if os.name == "nt":   # the source read must really go around the memory cache on Windows
+        n, _ = ezcopy._read_test([(os.path.join(card, "DCIM", "IMG_0.CR3"), 3 * B + 5)], 5, 1 << 30,
+                                 threading.Event(), direct=True)
+        assert n == 3 * B + 5, n
+    gone = threading.Event()
+    gone.set()
+    try:
+        ezcopy.speed_test([card], out, cancel=gone, seconds=0.5, max_bytes=64 << 20)
+        raise AssertionError("should cancel")
+    except ezcopy.Cancelled:
+        pass
+    assert os.listdir(out) == [], os.listdir(out)
+    try:
+        ezcopy.speed_test([os.path.join(card, "empty.txt")], out)
+        raise AssertionError("should say there is nothing to test")
+    except ezcopy.EzCopyError as e:
+        assert "Nothing to test" in str(e), e
+    # the limit and tip follow the slowest part
+    r = ezcopy.SpeedResult(read=400e6, write=150e6, readback=3e9, cpu=1.5e9, verify=True)
+    ezcopy._estimate(r, True, "hdd")
+    assert r.limit == "writing to the destination" and "hard disk" in r.tip, r
+    r = ezcopy.SpeedResult(read=37e6, write=150e6, readback=3e9, cpu=1.5e9, verify=False)
+    ezcopy._estimate(r, True, "hdd")
+    assert r.speed == 37e6 and "USB 2.0" in r.tip, r
+    assert threading.active_count() == before, "speed test left threads running"
+
     print("ALL EZCOPY CHECKS PASSED")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)

@@ -6,11 +6,14 @@
       --no-verify   skip the read-back check (faster, NOT recommended)
       --workers N   parallel small-file copies (default 8)
       --drives M    auto (default) | hdd | ssd  -> how big files are scheduled, see "Speed" below
+  python3 ezcopy.py --speedtest SRC [SRC ...] DEST  -> measure the drives and processor, copy nothing
 
 How a file is copied (this is the whole safety story):
   1. read source in 8 MB chunks, hashing (SHA-256) the bytes as they are read
   2. write them to  <name>.ezcopy-part  next to the final name, then fsync
-  3. re-read the written file (bypassing the OS cache where possible) and compare hashes
+  3. read the written file back and compare hashes. macOS and Windows often answer this read from memory
+     (a file just written may still be cached there); then it proves the copy step, not the disk's storage.
+     Measured on a Mac: a 300 MB file came back from memory, a 1.2 GB video sometimes from the disk
   4. only if equal: atomically rename to the final name. Any mismatch -> retry once, then report FAILED
 So a file with its final name was always verified; a crash leaves only *.ezcopy-part. Source is never touched.
 
@@ -138,9 +141,10 @@ def _chunks(path, size, nocache=False):
 
 
 def hash_file(path, cancel=None, prog=None):
-    """SHA-256 of a file, reading around the OS cache so the disk itself is checked.
-    ponytail: Windows has no cache bypass here (needs aligned unbuffered I/O), so on Windows
-    the read-back can be served from RAM; it still catches copy/short-write errors."""
+    """SHA-256 of a file. The no-cache hint keeps it from filling the OS cache, but parts already cached are
+    still served from RAM (measured on macOS: a just-written file read back at 20 GB/s with F_NOCACHE), and
+    Windows has no bypass here at all. So for a file just copied it catches copy/short-write errors, not a
+    disk that stores bytes wrongly."""
     h = hashlib.sha256()
     size = os.path.getsize(path)
     if size > BUF:
@@ -375,6 +379,21 @@ def _kind_windows(path):
         k32.CloseHandle(h)
 
 
+def _existing(path):
+    """path, or its nearest parent that exists (the destination folder may not be made yet)."""
+    while not os.path.exists(path):
+        path = os.path.dirname(path) or "."
+    return path
+
+
+def _drive_mode(sources, probe, drives):
+    """-> (hard-disk mode?, source kinds, destination kind). Unknown drives count as hard disks."""
+    src_kinds = sorted({drive_kind(s) or "unknown" for s in sources if os.path.exists(s)})
+    dst_kind = drive_kind(probe) or "unknown"
+    hdd = drives == "hdd" or (drives == "auto" and bool({dst_kind, *src_kinds} & {"hdd", "unknown"}))
+    return hdd, src_kinds, dst_kind
+
+
 # ----------------------------------------------------------------------------- planning and running
 def plan(sources, dest):
     """-> (files [(src, dst, size)], dirs [dst dirs], notes). Folders keep their own name, like Finder."""
@@ -429,16 +448,12 @@ def run(sources, dest, verify=True, workers=8, progress_cb=None, cancel=None, dr
         else:
             todo.append((s, d, size))
     need = sum(x[2] for x in todo)
-    probe = dest
-    while not os.path.exists(probe):
-        probe = os.path.dirname(probe) or "."
+    probe = _existing(dest)
     free = shutil.disk_usage(probe).free
     if need + (64 << 20) > free:
         raise EzCopyError(f"Not enough space on destination: need {need / 2**30:.2f} GB, free {free / 2**30:.2f} GB")
 
-    src_kinds = sorted({drive_kind(s) or "unknown" for s in sources if os.path.exists(s)})
-    dst_kind = drive_kind(probe) or "unknown"
-    hdd = drives == "hdd" or (drives == "auto" and bool({dst_kind, *src_kinds} & {"hdd", "unknown"}))
+    hdd, src_kinds, dst_kind = _drive_mode(sources, probe, drives)
     mode = "hard-disk mode" if hdd else "parallel mode"
     rep.drives = f"from {'+'.join(src_kinds) or '?'} to {dst_kind}: {mode}"
 
@@ -472,8 +487,9 @@ def run(sources, dest, verify=True, workers=8, progress_cb=None, cancel=None, dr
 
     if hdd:
         # one file streams at a time (gate); the 2nd worker flushes + verifies the previous file meanwhile.
-        # On a Mac the read-back really reads the disk, so if the destination may be a hard disk, keep that
-        # inside the gate too (it would make the destination head jump between two files).
+        # The read-back often comes from memory, but a file too big to stay cached is read from the disk;
+        # on a Mac with a hard disk (or unknown) destination keep it inside the gate, so the head doesn't
+        # jump between two files. (Windows: same reasoning, but not measured there, so left as it was.)
         gate = threading.Lock()
         vgate = gate if (sys.platform == "darwin" and dst_kind != "ssd") else None
         cut, groups = HDD_BIG, ((workers, None, None), (2, gate, vgate))
@@ -554,6 +570,303 @@ class Speedo:
         return (p.copied - c0) / el, ((p.total - p.work) / rate if rate > 0 else 0)
 
 
+# ----------------------------------------------------------------------------- speed test
+@dataclass
+class SpeedResult:
+    """What the speed test measured. Speeds are bytes per second."""
+    src: str = ""
+    dst: str = ""
+    mode: str = ""
+    verify: bool = True
+    read: float = 0.0          # source drive (Windows: around the memory cache)
+    write: float = 0.0         # destination drive, including the flush to the disk
+    readback: float = 0.0      # destination read-back, done exactly the way the check does it
+    cpu: float = 0.0           # SHA-256 on one processor core
+    speed: float = 0.0         # what EzCopy should reach on big files
+    limit: str = ""            # the slowest part, in words
+    tip: str = ""
+    total: int = 0             # bytes in the chosen sources
+    files: int = 0
+    notes: list = field(default_factory=list)
+
+
+class _Reader:
+    """Reads chunks of files the way hash_file does (no-cache hint; cached parts still come from RAM)."""
+    def __init__(self):
+        self.mv = memoryview(bytearray(BUF))
+        self.path = self.f = None
+
+    def read(self, path, off, n):
+        if path != self.path:
+            self.close()
+            self.f = _open_read(lp(path))
+            _no_cache(self.f)
+            self.path = path
+        self.f.seek(off)
+        got = 0
+        while got < n:
+            k = self.f.readinto(self.mv[got:n])
+            if not k:
+                break
+            got += k
+        return got
+
+    def close(self):
+        if self.f:
+            self.f.close()
+        self.path = self.f = None
+
+
+class _WinDirect:
+    """Windows only: reads around the memory cache (FILE_FLAG_NO_BUFFERING), so files that were read a
+    minute ago are measured at the drive's speed, not RAM speed. That needs a sector-aligned buffer (an mmap
+    is page-aligned), offsets (multiples of BUF) and lengths (rounded up to 4 KB; the end of a file just
+    returns fewer bytes)."""
+    def __init__(self):
+        import ctypes
+        import mmap
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                  wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k.SetFilePointerEx.argtypes = [wintypes.HANDLE, ctypes.c_longlong, ctypes.c_void_p, wintypes.DWORD]
+        k.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                               ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.k, self.ct, self.got = k, ctypes, wintypes.DWORD()
+        self.map = mmap.mmap(-1, BUF)
+        self.cbuf = (ctypes.c_char * BUF).from_buffer(self.map)
+        self.addr = ctypes.addressof(self.cbuf)
+        self.path = self.h = None
+
+    def read(self, path, off, n):
+        k, ct = self.k, self.ct
+        if path != self.path:
+            self.close()
+            # GENERIC_READ; share read/write/delete; OPEN_EXISTING; NO_BUFFERING | SEQUENTIAL_SCAN
+            h = k.CreateFileW(lp(path), 0x80000000, 7, None, 3, 0x20000000 | 0x08000000, None)
+            if not h or h == ct.c_void_p(-1).value:
+                raise ct.WinError(ct.get_last_error())
+            self.h, self.path = h, path
+        if not k.SetFilePointerEx(self.h, off, None, 0) or \
+                not k.ReadFile(self.h, self.addr, -(-n // 4096) * 4096, ct.byref(self.got), None):
+            raise ct.WinError(ct.get_last_error())
+        return min(self.got.value, n)
+
+    def close(self):
+        if self.h:
+            self.k.CloseHandle(self.h)
+        self.path = self.h = None
+
+
+def _read_test(files, seconds, max_bytes, cancel, direct=False):
+    """Read up to max_bytes of files [(path, size)] for at most `seconds`, with DEPTH reads in flight like a
+    copy. -> (bytes read, seconds taken)."""
+    jobs, planned = queue.Queue(), 0
+    for p, size in files:
+        for off in range(0, size, BUF):
+            if planned >= max_bytes:
+                break
+            jobs.put((p, off, min(BUF, size - off)))
+            planned += min(BUF, size - off)
+    got, lock, err = [0], threading.Lock(), []
+    t0 = time.perf_counter()
+
+    def worker():
+        r = None
+        try:
+            r = _WinDirect() if direct else _Reader()
+            while not err and not cancel.is_set() and time.perf_counter() - t0 < seconds:
+                try:
+                    p, off, n = jobs.get_nowait()
+                except queue.Empty:
+                    return
+                k = r.read(p, off, n)
+                with lock:
+                    got[0] += k
+        except BaseException as e:
+            err.append(e)
+        finally:
+            if r:
+                r.close()
+
+    ts = [threading.Thread(target=worker, daemon=True) for _ in range(DEPTH)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    if cancel.is_set():
+        raise Cancelled()
+    if err:
+        raise err[0]
+    return got[0], time.perf_counter() - t0
+
+
+def _write_test(folder, seconds, budget, cancel, made):
+    """Write test files into folder the way a hard-disk copy writes: 64 MB files, each one flushed to the
+    disk while the next is written. Appends [path, size] to `made` (the caller deletes them).
+    -> (bytes written and flushed, seconds taken)."""
+    data = memoryview(os.urandom(BUF))     # random: a drive that compresses can't cheat
+    written, pending = 0, None
+    t0 = time.perf_counter()
+
+    def flush(f):
+        try:
+            os.fsync(f.fileno())
+        finally:
+            f.close()
+
+    with ThreadPoolExecutor(1) as ex:
+        while written < budget and time.perf_counter() - t0 < seconds:
+            p = os.path.join(folder, f".ezcopy-speedtest-{os.getpid()}-{len(made)}.tmp")
+            made.append([p, 0])
+            f = open(lp(p), "wb")
+            try:
+                while made[-1][1] < (64 << 20) and written < budget:
+                    if cancel.is_set():
+                        raise Cancelled()
+                    f.write(data)
+                    made[-1][1] += BUF
+                    written += BUF
+                if pending:
+                    pending.result()       # at most one file flushing while the next one is written
+            except BaseException:
+                f.close()
+                raise
+            pending = ex.submit(flush, f)
+        if pending:
+            pending.result()
+    return written, time.perf_counter() - t0
+
+
+def _cpu_test(seconds, cancel):
+    """SHA-256 speed of one processor core."""
+    data, h, n = os.urandom(BUF), hashlib.sha256(), 0
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < seconds:
+        if cancel.is_set():
+            raise Cancelled()
+        h.update(data)
+        n += BUF
+    return n / (time.perf_counter() - t0)
+
+
+def speed_test(sources, dest, verify=True, drives="auto", cancel=None, step=None, seconds=6.0, max_bytes=4 << 30):
+    """Measure the source drive, the destination drive and the processor the way a copy uses them, and work
+    out how fast EzCopy can copy big files here and what holds it back. Copies nothing; writes test files
+    to the destination and deletes them. step(fraction done, text) reports progress."""
+    cancel = cancel or threading.Event()
+    step = step or (lambda f, t: None)
+    dest = os.path.abspath(dest)
+    files = [(s, size) for s, _, size in plan(sources, dest)[0] if size]
+    if not files:
+        raise EzCopyError("Nothing to test: the chosen sources have no files with data in them.")
+    probe = _existing(dest)
+    hdd, src_kinds, dst_kind = _drive_mode(sources, probe, drives)
+    r = SpeedResult(src="+".join(src_kinds) or "unknown", dst=dst_kind, verify=verify,
+                    mode="hard-disk mode" if hdd else "parallel mode",
+                    total=sum(x[1] for x in files), files=len(files))
+
+    step(0.0, "reading the source…")
+    sample = sorted(files, key=lambda x: -x[1])     # biggest files first: that is where a copy's time goes
+    direct = os.name == "nt"
+    try:
+        n, t = _read_test(sample, seconds, max_bytes, cancel, direct)
+    except OSError:
+        if not direct:
+            raise
+        direct = False
+        n, t = _read_test(sample, seconds, max_bytes, cancel)
+    r.read = n / t
+    if n < (256 << 20):
+        r.notes.append(f"Only {fmt_size(n)} was there to read, so the source figure is rough.")
+    if not direct and r.read > 2e9 and src_kinds != ["ssd"]:
+        r.notes.append("The source read faster than a drive like that can: the files were probably still in "
+                       "memory from an earlier read. Unplug and replug it (or the card) and test again.")
+
+    step(0.3, "writing test files to the destination…")
+    budget = min(max_bytes, shutil.disk_usage(probe).free - (1 << 30))
+    if budget < (64 << 20):
+        raise EzCopyError("Not enough free space on the destination for a speed test (it needs about 1.1 GB free).")
+    made = []
+    try:
+        n, t = _write_test(probe, seconds, budget, cancel, made)
+        r.write = n / t
+        if verify:
+            step(0.6, "reading them back, the way the check does…")
+            n, t = _read_test(made, seconds, max_bytes, cancel)
+            r.readback = n / t
+    finally:
+        for p, _ in made:
+            _rm(lp(p))
+            _drop_sidecar(lp(p))
+
+    step(0.9, "timing the checksums…")
+    r.cpu = _cpu_test(1.0, cancel)
+    _estimate(r, hdd, dst_kind)
+    step(1.0, "done")
+    return r
+
+
+def _estimate(r, hdd, dst_kind):
+    """Fill r.speed / r.limit / r.tip from the measurements, following how run() schedules big files."""
+    cpu = r.cpu * (1 if hdd else 2)    # big files: one streams at a time on hard disks, two otherwise
+    parts = {"read": (r.read, "reading the source"), "write": (r.write, "writing to the destination"),
+             "cpu": (cpu, "the processor (checksums)")}
+    if r.verify:
+        parts["readback"] = (r.readback, "reading back for the check")
+    copy = min(parts[k][0] for k in ("read", "write", "cpu"))
+    key = min(parts, key=lambda k: parts[k][0])
+    r.speed = copy
+    if r.verify:
+        check = min(r.readback, cpu)
+        if sys.platform == "darwin" and hdd and dst_kind != "ssd":
+            # run() keeps the Mac check inside the one-file gate, so copy and check take turns
+            r.speed = 1 / (1 / copy + 1 / check) if copy > 0 and check > 0 else 0.0
+        else:
+            r.speed = min(copy, check)             # the check of one file overlaps the copy of the next
+    r.limit = parts[key][1]
+    value = parts[key][0]
+    if key != "cpu" and 18e6 <= value <= 46e6:
+        r.tip = (f"{fmt_size(value)}/s is about USB 2.0 speed. If this drive or card should be faster, plug it "
+                 "straight into a USB 3 port (blue, marked SS, or USB-C), not through a hub or an old card reader.")
+    elif key == "read":
+        r.tip = ("The source is the slowest part. For memory cards, a USB 3.2 / USB-C reader made for that "
+                 "card type is often the fix.")
+    elif key == "write" and dst_kind == "network":
+        r.tip = "The network (or the NAS) is the slowest part. A 1 Gb/s network tops out near 110 MB/s."
+    elif key == "write" and dst_kind != "ssd":
+        r.tip = ("One hard disk cannot write much faster than this. To copy faster, copy to an SSD "
+                 "(and from the SSD to the hard disk later).")
+    elif key == "cpu":
+        r.tip = ("The processor's checksum speed is the slowest part. Every byte is checksummed, even with "
+                 "Verify off, so only a faster processor would help.")
+    if r.verify and r.readback > 2 * max(r.write, 1):
+        r.notes.append("The check read the test files back from memory (the system keeps files it just wrote "
+                       "there), so it cost processor time, not disk time. A file too big to stay in memory (a long "
+                       "video) is read back from the disk instead, and can take up to twice as long.")
+
+
+def speed_lines(r):
+    """The speed test result as lines of text for the window and the command line."""
+    rows = [(f"Reading the source ({r.src})", r.read), (f"Writing the destination ({r.dst})", r.write)]
+    if r.verify:
+        rows.append(("Reading back for the check", r.readback))
+    rows.append(("Checksums, one processor core", r.cpu))
+    out = ["Speed test (big files, measured the way EzCopy copies them):"]
+    out += [f"  {name}: {fmt_size(v)}/s" for name, v in rows]
+    out.append(f"EzCopy should copy big files at about {fmt_size(r.speed)}/s here "
+               f"({r.mode}, {'with' if r.verify else 'no'} verify). Slowest part: {r.limit}.")
+    if r.speed > 0:
+        out.append(f"Your {fmt_size(r.total)} ({r.files} files) would take about {fmt_time(r.total / r.speed)}. "
+                   "Folders of many small files take longer.")
+    if r.tip:
+        out.append("Tip: " + r.tip)
+    out += ["Note: " + n for n in r.notes]
+    return out
+
+
 # ----------------------------------------------------------------------------- command line
 def cli(argv):
     ap = argparse.ArgumentParser(prog="ezcopy", description="Fast verified copy.")
@@ -561,9 +874,20 @@ def cli(argv):
     ap.add_argument("--no-verify", action="store_true")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--drives", choices=("auto", "hdd", "ssd"), default="auto")
+    ap.add_argument("--speedtest", action="store_true",
+                    help="measure the drives and the processor and say how fast a copy can go; copies nothing")
     a = ap.parse_args(argv)
     if len(a.paths) < 2:
         ap.error("need at least one SRC and a DEST")
+    if a.speedtest:
+        try:
+            r = speed_test(a.paths[:-1], a.paths[-1], not a.no_verify, a.drives,
+                           step=lambda f, t: print(f"\rspeed test: {t:<50}", end="", flush=True))
+        except (EzCopyError, OSError) as e:
+            print(f"\nERROR: {e}")
+            return 2
+        print("\r" + " " * 64 + "\r" + "\n".join(speed_lines(r)))
+        return 0
     holder = {}
     done = threading.Event()
 
@@ -655,8 +979,12 @@ def gui():
     ttk.Spinbox(opt2, from_=1, to=32, width=3, textvariable=workers).pack(side="right")
     ttk.Label(opt2, text="Parallel small files:").pack(side="right", padx=4)
 
-    go = ttk.Button(root, text="START COPY")
-    go.pack(fill="x", padx=10, pady=6)
+    brow = ttk.Frame(root)
+    brow.pack(fill="x", padx=10, pady=6)
+    go = ttk.Button(brow, text="START COPY")
+    go.pack(side="left", fill="x", expand=True)
+    tbtn = ttk.Button(brow, text="Speed test")
+    tbtn.pack(side="left", padx=(6, 0))
     bar = ttk.Progressbar(root, maximum=100)
     bar.pack(fill="x", padx=10)
     status = tk.StringVar(value="Ready.")
@@ -688,6 +1016,7 @@ def gui():
             root.after(250, poll)
             return
         go.configure(text="START COPY", command=start)
+        tbtn.state(["!disabled"])
         if state["err"]:
             status.set("Could not start.")
             messagebox.showerror("EzCopy", str(state["err"]))
@@ -721,10 +1050,56 @@ def gui():
                                                      DRIVE_CHOICES.get(drives.get(), "auto")), daemon=True)
         thread.start()
         go.configure(text="CANCEL", command=state["cancel"].set)
+        tbtn.state(["disabled"])
         poll()
+
+    def test_work(srcs, dst, ver, drv):   # off the main thread, like work()
+        try:
+            state["test"] = speed_test(srcs, dst, ver, drv, state["cancel"], lambda f, t: state.update(step=(f, t)))
+        except Exception as e:
+            state["err"] = e
+
+    def poll_test():
+        if state["step"]:
+            frac, text = state["step"]
+            bar["value"] = 100 * frac
+            status.set(f"Speed test: {text}")
+        if thread.is_alive():
+            root.after(250, poll_test)
+            return
+        tbtn.configure(text="Speed test", command=start_test)
+        go.state(["!disabled"])
+        err = state["err"]
+        if isinstance(err, Cancelled):
+            status.set("Speed test cancelled.")
+        elif err:
+            status.set("Speed test failed.")
+            messagebox.showerror("EzCopy", str(err))
+        else:
+            r = state["test"]
+            for line in speed_lines(r):
+                say(line)
+            status.set(f"Speed test: about {fmt_size(r.speed)}/s possible here. Slowest part: {r.limit}.")
+
+    def start_test():
+        nonlocal thread
+        if not sources or not dest.get().strip():
+            messagebox.showinfo("EzCopy", "Add what you want to copy and choose a destination first. The test "
+                                          "reads from the first and writes test files (deleted after) to the second.")
+            return
+        state.update(test=None, step=None, err=None, cancel=threading.Event())
+        bar["value"] = 0
+        status.set("Speed test: starting…")
+        thread = threading.Thread(target=test_work, args=(list(sources), dest.get().strip(), verify.get(),
+                                                          DRIVE_CHOICES.get(drives.get(), "auto")), daemon=True)
+        thread.start()
+        go.state(["disabled"])
+        tbtn.configure(text="Cancel test", command=state["cancel"].set)
+        poll_test()
 
     thread = threading.Thread()
     go.configure(command=start)
+    tbtn.configure(command=start_test)
     root.mainloop()
 
 

@@ -5,7 +5,8 @@ copied file and compares a SHA-256 checksum with the source** before it gets its
 
 - Window: open the app, add files/folders, choose destination, START COPY.
 - Command line: `python3 ezcopy.py SRC [SRC ...] DEST` (exit code 1 if any file failed).
-  Options: `--drives auto|hdd|ssd`, `--workers N` (parallel small files), `--no-verify`.
+  Options: `--drives auto|hdd|ssd`, `--workers N` (parallel small files), `--no-verify`,
+  `--speedtest` (measure only, copy nothing).
 - Every run writes a log with the checksum of each file to `~/EzCopy Logs/`.
 - Run it again on the same folders to resume: files already copied (same size + time) are skipped.
 - Self-test (includes simulated corruption): `python3 test_ezcopy.py`
@@ -18,6 +19,18 @@ copied file and compares a SHA-256 checksum with the source** before it gets its
   to GitHub and download both builds from Actions (`.github/workflows/build.yml`). Windows SmartScreen will
   warn the first time: More info -> Run anyway.
 - **Intel Macs:** run `build_mac.sh` on an Intel Mac (don't run it from an exFAT drive).
+
+## Speed test: what limits my copy?
+Add what you want to copy and choose the destination, then press **Speed test** (about 20 seconds; nothing is
+copied). It measures, the way a copy uses them:
+- **reading the source**: the card, card reader or drive. On Windows this goes around the memory cache, so
+  files you opened a minute ago still give the drive's real speed;
+- **writing the destination**: test files are written and flushed to the disk, then deleted;
+- **reading back for the check**, and the **processor's checksum speed**.
+
+It then says how fast EzCopy can copy big files there, which part is the slowest, how long your selection
+would take, and what would help, for example a USB 2.0 port or hub, or a single hard disk.
+Command line: `python3 ezcopy.py --speedtest SRC DEST`.
 
 ## Speed: how fast can it go?
 A copy can never be faster than the **slower drive, or the slower cable/port**, whichever is lower:
@@ -47,7 +60,10 @@ What EzCopy does to reach that limit:
 ## What it can and cannot do
 - It removes software overhead (many small files copy ~2.5x faster than `cp`/Finder in our test).
   It cannot beat your drive, port or network (see the table above).
-- Verification re-reads the destination, so a verified copy takes longer than an unverified one. Keep it on.
+- Verification reads every copied file back and compares checksums. Keep it on.
+- Mac and Windows often serve that read-back from memory, because a file just written is still cached there.
+  Then the check costs little time, and it proves the copy step and the file size, but not that the disk
+  stored the bytes correctly. A file too big to stay in memory (a long video) is read back from the disk
+  itself; that file then takes up to twice as long.
 - Symlinks are skipped (listed in the log). Permissions/Finder tags/extended attributes are not copied; timestamps are.
-- Windows: the read-back may be served from the OS cache, so it proves the copy logic and file size, but cannot
-  prove the bytes reached the platter. The Windows build is untested by the author.
+- The Windows build is untested by the author.
