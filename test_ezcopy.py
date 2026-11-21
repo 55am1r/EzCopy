@@ -96,6 +96,94 @@ try:
     rep = ezcopy.run([src], os.path.join(tmp, "out4"), cancel=ev)
     assert rep.cancelled and rep.copied == 0
 
+    # 7. streaming copy: chunk-edge sizes come out exact
+    edge = os.path.join(tmp, "edge")
+    os.makedirs(edge)
+    B = ezcopy.BUF
+    for n in (B - 1, B, B + 1, 2 * B, 3 * B - 1, 17 << 20, 18 << 20, 19 << 20):
+        open(os.path.join(edge, f"e{n}.bin"), "wb").write(os.urandom(n))
+    for mode in ("hdd", "ssd"):
+        rep = ezcopy.run([edge], os.path.join(tmp, f"out-{mode}"), drives=mode)
+        assert rep.ok and rep.copied == 8 and ("hard-disk" in rep.drives) == (mode == "hdd"), rep
+        assert tree(os.path.join(tmp, f"out-{mode}", "edge")) == tree(edge)
+
+    # 8. hard-disk mode: never two big files streaming at once, and it really overlaps
+    real_stream, live = ezcopy._stream, {"now": 0, "max": 0}
+    mx = threading.Lock()
+
+    def counted(*a, **k):
+        with mx:
+            live["now"] += 1
+            live["max"] = max(live["max"], live["now"])
+        try:
+            return real_stream(*a, **k)
+        finally:
+            with mx:
+                live["now"] -= 1
+    ezcopy._stream = counted
+    rep = ezcopy.run([edge], os.path.join(tmp, "out-gate"), drives="hdd")
+    assert rep.ok and live["max"] == 1, (rep, live)
+    live["max"] = 0
+    rep = ezcopy.run([edge], os.path.join(tmp, "out-par"), drives="ssd", workers=8)
+    assert rep.ok and live["max"] >= 2, (rep, live)          # SSD mode: small files in parallel
+    ezcopy._stream = real_stream
+
+    # 9. a write error or a cancel in the middle of a stream: raised, and the reader thread ends
+    class Boom:
+        def __init__(self):
+            self.n = 0
+
+        def write(self, b):
+            self.n += 1
+            if self.n == 2:
+                raise OSError("disk full")
+    big = os.path.join(src, "a", "b", "big.bin")
+    size = os.path.getsize(big)
+    prog = ezcopy.Progress(1, 1)
+    before = threading.active_count()
+    try:
+        ezcopy._stream(big, Boom(), hashlib.sha256(), threading.Event(), prog, size)
+        raise AssertionError("should raise")
+    except OSError as e:
+        assert "disk full" in str(e)
+    cancel_now = threading.Event()
+
+    class CancelAfterFirst(ezcopy.Progress):
+        def add(self, n, copied=False):
+            cancel_now.set()
+    with open(os.path.join(tmp, "x.bin"), "wb") as fo:
+        try:
+            ezcopy._stream(big, fo, hashlib.sha256(), cancel_now, CancelAfterFirst(1, 1), size)
+            raise AssertionError("should cancel")
+        except ezcopy.Cancelled:
+            pass
+    # source shrinks mid-copy: a read error, not a silently short copy
+    shrink = os.path.join(tmp, "shrink.bin")
+    open(shrink, "wb").write(os.urandom(10 * B))
+    gen = ezcopy._chunks(shrink, 10 * B)
+    first = next(gen)
+    assert bytes(first[:16]) == open(shrink, "rb").read(16)
+    os.truncate(shrink, B)
+    try:
+        for _ in gen:
+            pass
+        raise AssertionError("should notice the file got shorter")
+    except OSError as e:
+        assert "shorter" in str(e), e
+    gen.close()
+    assert threading.active_count() == before, "reader threads left running"
+
+    # 9b. the parallel-read checksum equals a plain one, for awkward sizes
+    for n in (B + 1, 5 * B - 3):
+        p = os.path.join(tmp, f"h{n}.bin")
+        open(p, "wb").write(os.urandom(n))
+        assert ezcopy.hash_file(p) == sha(p)
+
+    # 10. drive detection never crashes; says what it found
+    kind = ezcopy.drive_kind(tmp)
+    assert kind in ("hdd", "ssd", "network", None), kind
+    print(f"drive kind of {tmp}: {kind}")
+
     print("ALL EZCOPY CHECKS PASSED")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)

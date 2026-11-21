@@ -5,6 +5,7 @@ copied file and compares a SHA-256 checksum with the source** before it gets its
 
 - Window: open the app, add files/folders, choose destination, START COPY.
 - Command line: `python3 ezcopy.py SRC [SRC ...] DEST` (exit code 1 if any file failed).
+  Options: `--drives auto|hdd|ssd`, `--workers N` (parallel small files), `--no-verify`.
 - Every run writes a log with the checksum of each file to `~/EzCopy Logs/`.
 - Run it again on the same folders to resume: files already copied (same size + time) are skipped.
 - Self-test (includes simulated corruption): `python3 test_ezcopy.py`
@@ -18,9 +19,34 @@ copied file and compares a SHA-256 checksum with the source** before it gets its
   warn the first time: More info -> Run anyway.
 - **Intel Macs:** run `build_mac.sh` on an Intel Mac (don't run it from an exFAT drive).
 
+## Speed: how fast can it go?
+A copy can never be faster than the **slower drive, or the slower cable/port**, whichever is lower:
+
+| Link / drive                                   | real speed    | 200 GB takes at least |
+|------------------------------------------------|---------------|-----------------------|
+| USB 2.0 port or USB 2.0 hub (any drive)        | ~35-40 MB/s   | ~1 h 30 m             |
+| USB 3 / USB-C hard disk, or internal SATA HDD  | ~120-220 MB/s | ~15-30 min            |
+| SMR hard disk during long writes               | can drop to 30-60 MB/s | 1 h+         |
+| SATA SSD / NVMe                                | 500-3000 MB/s | a few minutes         |
+
+**Check the port first.** A USB 3 drive plugged into a USB 2.0 port, an old hub or a front-panel port runs
+at USB 2.0 speed. On Windows use the blue / "SS" ports at the back of the PC (or USB-C), no hub.
+
+What EzCopy does to reach that limit:
+- **Drives: Auto-detect** finds out whether each drive is a hard disk, SSD or network drive.
+  When a hard disk is involved (or Windows can't tell, e.g. some USB cases), it uses **hard-disk mode**:
+  files of 16 MB and up are copied one at a time, so the disk head moves straight through each file instead
+  of jumping between files. The flush and read-back of one file overlap the copying of the next.
+- It keeps 4 reads in flight per file. One read at a time leaves a USB or network drive idle between
+  requests (measured on a USB hard disk: 19 MB/s with one read at a time, 37 MB/s with 4).
+- Small files are copied in parallel (Parallel small files, default 8): there the per-file overhead is what costs.
+- The speed and time left shown are measured over the last 30 seconds. The first seconds of any copy look
+  too fast because the OS cache soaks them up, so don't trust an early estimate (Windows Explorer's either).
+- If a USB hard disk is not detected (the window says "parallel mode"), choose **Drives: Hard disks** yourself.
+
 ## What it can and cannot do
 - It removes software overhead (many small files copy ~2.5x faster than `cp`/Finder in our test).
-  It cannot beat your drive or network: one huge video file copies at about the same speed as `cp`.
+  It cannot beat your drive, port or network (see the table above).
 - Verification re-reads the destination, so a verified copy takes longer than an unverified one. Keep it on.
 - Symlinks are skipped (listed in the log). Permissions/Finder tags/extended attributes are not copied; timestamps are.
 - Windows: the read-back may be served from the OS cache, so it proves the copy logic and file size, but cannot
