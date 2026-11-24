@@ -51,11 +51,17 @@ try:
     rep = ezcopy.run([src], dst)
     assert rep.ok and rep.copied == 0 and rep.skipped == 203, rep
 
-    # 3. a changed source file is re-copied, never silently kept
+    # 3. a destination file that differs is NEVER silently replaced: reported as a conflict, left untouched;
+    #    only replace=True overwrites it
     p = os.path.join(src, "a", "f5.bin")
+    q = os.path.join(dst, "Shoot", "a", "f5.bin")
+    before = sha(q)
     open(p, "wb").write(b"new content!")
     rep = ezcopy.run([src], dst)
-    assert rep.copied == 1 and sha(os.path.join(dst, "Shoot", "a", "f5.bin")) == sha(p)
+    assert not rep.ok and len(rep.failed) == 1 and "CONFLICT" in rep.failed[0][1] and rep.copied == 0, rep
+    assert sha(q) == before
+    rep = ezcopy.run([src], dst, replace=True)
+    assert rep.ok and rep.copied == 1 and sha(q) == sha(p)
 
     # 4. corruption on disk after write -> detected, retried once, succeeds when it was transient
     real, calls = ezcopy.hash_file, {"n": 0}
@@ -226,6 +232,58 @@ try:
     ezcopy._estimate(r, True, "hdd")
     assert r.speed == 37e6 and "USB 2.0" in r.tip, r
     assert threading.active_count() == before, "speed test left threads running"
+
+    # 12. two cards holding the same file name copied into one folder: BOTH survive (the 2nd gets "(2)"),
+    #     also for names that differ only in case
+    c1, c2, o12 = (os.path.join(tmp, n) for n in ("card1", "card2", "out12"))
+    for c, body in ((c1, b"card one footage"), (c2, b"card two footage")):
+        os.makedirs(os.path.join(c, "DCIM"))
+        open(os.path.join(c, "DCIM", "IMG_0001.JPG"), "wb").write(body)
+        open(os.path.join(c, "DCIM", "clip.MOV" if c == c1 else "CLIP.mov"), "wb").write(body + b"!")
+    rep = ezcopy.run([os.path.join(c1, "DCIM"), os.path.join(c2, "DCIM")], o12)
+    assert rep.ok and rep.copied == 4, rep
+    got = sorted(open(os.path.join(r, f), "rb").read() for r, _, fs in os.walk(o12) for f in fs)
+    assert got == sorted([b"card one footage", b"card two footage", b"card one footage!", b"card two footage!"]), got
+    assert len([n for n in rep.notes if "same name" in n]) == 2, rep.notes
+
+    # 13. the cheap resume check can be fooled (same size + same time, different bytes); compare=True is not
+    o13 = os.path.join(tmp, "out13")
+    f13 = os.path.join(tmp, "f13.bin")
+    open(f13, "wb").write(os.urandom(50000))
+    assert ezcopy.run([f13], o13).ok
+    d13 = os.path.join(o13, "f13.bin")
+    st = os.stat(d13)
+    with open(d13, "r+b") as f:
+        f.seek(100)
+        f.write(b"\x00\x01\x02")
+    os.utime(d13, ns=(st.st_atime_ns, st.st_mtime_ns))             # size and time look untouched
+    rep = ezcopy.run([f13], o13)
+    assert rep.ok and rep.skipped == 1 and sha(d13) != sha(f13)    # documented limit of the fast check
+    rep = ezcopy.run([f13], o13, compare=True)
+    assert not rep.ok and "CONFLICT" in rep.failed[0][1] and sha(d13) != sha(f13), rep
+    rep = ezcopy.run([f13], o13, compare=True, replace=True)
+    assert rep.ok and rep.copied == 1 and sha(d13) == sha(f13), rep
+    rep = ezcopy.run([f13], o13, compare=True)
+    assert rep.ok and rep.skipped == 1 and rep.copied == 0, rep
+
+    # 14. check mode: copies nothing, finds a changed byte and a missing file
+    rep = ezcopy.check([src], dst)
+    assert rep.kind == "check" and rep.ok and rep.copied == 203, rep
+    cs = os.path.join(dst, "Shoot", "a", "b", "big.bin")
+    st = os.stat(cs)
+    with open(cs, "r+b") as f:
+        f.seek(15 << 20)
+        f.write(b"\xaa")
+    os.utime(cs, ns=(st.st_atime_ns, st.st_mtime_ns))
+    os.remove(os.path.join(dst, "Shoot", "a", "f7.bin"))
+    rep = ezcopy.check([src], dst)
+    why = {os.path.basename(s): w for s, w in rep.failed}
+    assert not rep.ok and "DIFFERENT" in why["big.bin"] and "MISSING" in why["f7.bin"] and len(why) == 2, rep
+    assert not os.path.exists(os.path.join(dst, "Shoot", "a", "f7.bin"))        # check never copies
+    assert "PROBLEMS" in ezcopy.summary(rep)
+
+    # 15. no temp files are left behind by any of the runs above
+    assert not [f for r, _, fs in os.walk(tmp) for f in fs if f.endswith(ezcopy.PART)]
 
     print("ALL EZCOPY CHECKS PASSED")
 finally:

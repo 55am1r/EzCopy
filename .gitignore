@@ -6,3 +6,4 @@ installer/
 __pycache__/
 *.zip
 *.dmg
+EzCopy-Setup.exe

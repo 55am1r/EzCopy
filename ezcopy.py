@@ -6,11 +6,14 @@
       --no-verify   skip the read-back check (faster, NOT recommended)
       --workers N   parallel small-file copies (default 8)
       --drives M    auto (default) | hdd | ssd  -> how big files are scheduled, see "Speed" below
+      --replace     overwrite files at DEST that differ (default: report a CONFLICT and leave them alone)
+      --compare     also hash-compare files at DEST that look identical (size + time) before skipping them
+      --check       copy nothing: compare DEST with SRC byte for byte and report
   python3 ezcopy.py --speedtest SRC [SRC ...] DEST  -> measure the drives and processor, copy nothing
 
 How a file is copied (this is the whole safety story):
   1. read source in 8 MB chunks, hashing (SHA-256) the bytes as they are read
-  2. write them to  <name>.ezcopy-part  next to the final name, then fsync
+  2. write them to  <name>.<random>.ezcopy-part  next to the final name, then fsync
   3. read the written file back and compare hashes. macOS and Windows often answer this read from memory
      (a file just written may still be cached there); then it proves the copy step, not the disk's storage.
      Measured on a Mac: a 300 MB file came back from memory, a 1.2 GB video sometimes from the disk
@@ -34,10 +37,11 @@ import shutil
 import sys
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-BUF = 8 << 20                 # 8 MB chunks
+BUF = 8 << 20                # 8 MB chunks
 DEPTH = 4                     # reads in flight per file: slow USB/network drives need several queued
 BIG = 256 << 20               # SSD/network: files >= this are copied at most 2 at a time (drive-bound)
 HDD_BIG = 16 << 20            # hard disks: files >= this stream one at a time (no head seeking between files)
@@ -199,6 +203,7 @@ class Report:
     cancelled: bool = False
     log: str = ""
     drives: str = ""
+    kind: str = "copy"                           # "copy" or "check"
 
     @property
     def ok(self):
@@ -251,7 +256,7 @@ def copy_file(src, dst, verify, cancel, prog, gate=None, verify_gate=None):
     gate: held only while bytes stream source -> destination. On hard disks it is one shared lock, so
     one file streams at a time while the previous file is flushed and read back."""
     s, d = lp(src), lp(dst)
-    tmp = d + PART
+    tmp = f"{d}.{os.urandom(4).hex()}{PART}"      # unique: two EzCopy runs into one folder can't share a temp file
     gate, verify_gate = gate or _FREE, verify_gate or _FREE
     last = None
     for _ in range(2):
@@ -428,12 +433,41 @@ def plan(sources, dest):
                     files.append((p, os.path.join(out, x), os.path.getsize(p)))
         else:
             notes.append(f"not found: {src}")
-    return files, dirs, notes
+    return _unique(files, notes), dirs, notes
 
 
-def run(sources, dest, verify=True, workers=8, progress_cb=None, cancel=None, drives="auto"):
+def _key(p):
+    """Names that are the same file on a Mac or Windows drive: case-insensitive, NFC/NFD-insensitive."""
+    return unicodedata.normalize("NFC", os.path.abspath(p)).casefold()
+
+
+def _unique(files, notes):
+    """Two sources that land on the same destination name (two cards both holding IMG_0001.JPG) must never
+    overwrite each other: the later one is saved as 'IMG_0001 (2).JPG'."""
+    seen, out = set(), []
+    for s, d, size in files:
+        if _key(d) in seen:
+            stem, ext = os.path.splitext(d)
+            n = 2
+            while _key(f"{stem} ({n}){ext}") in seen:
+                n += 1
+            d = f"{stem} ({n}){ext}"
+            notes.append(f"same name as another file, saved as {os.path.basename(d)}: {s}")
+        seen.add(_key(d))
+        out.append((s, d, size))
+    return out
+
+
+CONFLICT = "CONFLICT: a different file is already at the destination; left untouched (use 'replace' to overwrite)"
+
+
+def run(sources, dest, verify=True, workers=8, progress_cb=None, cancel=None, drives="auto",
+        replace=False, compare=False):
     """Copy sources into dest. progress_cb(Progress) is called once, right after planning.
-    drives: 'auto' (detect), 'hdd' (big files one at a time) or 'ssd' (big files two at a time)."""
+    drives: 'auto' (detect), 'hdd' (big files one at a time) or 'ssd' (big files two at a time).
+    A file already at the destination is: skipped when size + time match; otherwise a CONFLICT that is
+    reported and left untouched, unless replace=True. compare=True also reads both copies of the
+    size+time matches and treats a difference as a conflict (slower: it reads every file twice)."""
     cancel = cancel or threading.Event()
     t0 = time.time()
     rep = Report()
@@ -441,12 +475,19 @@ def run(sources, dest, verify=True, workers=8, progress_cb=None, cancel=None, dr
     files, dirs, rep.notes = plan(sources, dest)
     if any(os.path.abspath(s) == os.path.abspath(d) for s, d, _ in files):
         raise EzCopyError("Source and destination are the same file.")
-    todo = []
+    todo, same = [], []
     for s, d, size in files:
-        if _up_to_date(lp(s), lp(d)):
-            rep.skipped += 1
-        else:
+        if not os.path.lexists(lp(d)):
             todo.append((s, d, size))
+        elif _up_to_date(lp(s), lp(d)):
+            if compare:
+                same.append((s, d, size))
+            else:
+                rep.skipped += 1
+        elif replace:
+            todo.append((s, d, size))
+        else:
+            rep.failed.append((s, CONFLICT))
     need = sum(x[2] for x in todo)
     probe = _existing(dest)
     free = shutil.disk_usage(probe).free
@@ -461,10 +502,38 @@ def run(sources, dest, verify=True, workers=8, progress_cb=None, cancel=None, dr
     for d in dirs:
         os.makedirs(lp(d), exist_ok=True)
         _drop_sidecar(lp(d))
-    prog = Progress(need * (2 if verify else 1), len(todo), mode)
+    prog = Progress(need * (2 if verify else 1) + 2 * sum(x[2] for x in same), len(todo) + len(same), mode)
     if progress_cb:
         progress_cb(prog)
     manifest, lock = [], threading.Lock()
+
+    def compare_job(item):
+        s, d, size = item
+        if cancel.is_set():
+            return
+        try:
+            digest = _hash_pair(s, d, cancel, prog)
+            with lock:
+                if digest:
+                    rep.skipped += 1
+                    manifest.append((digest, d))
+                elif replace:
+                    todo.append(item)
+                    prog.total += size * (2 if verify else 1)
+                else:
+                    rep.failed.append((s, CONFLICT))
+        except Cancelled:
+            return
+        except Exception as e:
+            with lock:
+                rep.failed.append((s, str(e)))
+        finally:
+            with prog.lock:
+                prog.files += 1
+
+    if same:                                   # reads two files at once, so on a hard disk go one file at a time
+        with ThreadPoolExecutor(1 if hdd else max(1, workers)) as ex:
+            list(ex.map(compare_job, same))
 
     def job(item, gate, verify_gate):
         s, d, size = item
@@ -511,14 +580,69 @@ def run(sources, dest, verify=True, workers=8, progress_cb=None, cancel=None, dr
     return rep
 
 
+def _hash_pair(s, d, cancel, prog):
+    """Hash a source and its destination copy side by side. -> the sha256 if identical, else None."""
+    with ThreadPoolExecutor(2) as ex:
+        a = ex.submit(hash_file, lp(s), cancel, prog)
+        b = ex.submit(hash_file, lp(d), cancel, prog)
+        ha, hb = a.result(), b.result()
+    return ha if ha == hb else None
+
+
+def check(sources, dest, workers=8, progress_cb=None, cancel=None, drives="auto"):
+    """Compare what is at dest with sources, byte for byte (SHA-256 of both). Copies and changes nothing.
+    Run it after the destination was unplugged and plugged back in, and it reads the real disk, not memory."""
+    cancel = cancel or threading.Event()
+    t0 = time.time()
+    rep = Report(kind="check")
+    dest = os.path.abspath(dest)
+    files, _, rep.notes = plan(sources, dest)
+    hdd, _, _ = _drive_mode(sources, _existing(dest), drives)
+    prog = Progress(2 * sum(x[2] for x in files), len(files), "check")
+    if progress_cb:
+        progress_cb(prog)
+    manifest, lock = [], threading.Lock()
+
+    def job(item):
+        s, d, size = item
+        if cancel.is_set():
+            return
+        try:
+            if not os.path.isfile(lp(d)):
+                raise OSError("MISSING at the destination")
+            digest = _hash_pair(s, d, cancel, prog)
+            if not digest:
+                raise OSError("DIFFERENT: the destination's contents do not match the source")
+            with lock:
+                rep.copied += 1               # in a check, "copied" counts the files that match
+                rep.bytes += size
+                manifest.append((digest, d))
+        except Cancelled:
+            return
+        except Exception as e:
+            with lock:
+                rep.failed.append((s, str(e)))
+        finally:
+            with prog.lock:
+                prog.files += 1
+
+    with ThreadPoolExecutor(1 if hdd else max(1, workers)) as ex:
+        list(ex.map(job, files))
+    rep.cancelled = cancel.is_set()
+    rep.seconds = time.time() - t0
+    rep.log = _write_log(rep, manifest, dest, True)
+    return rep
+
+
 def _write_log(rep, manifest, dest, verify):
     try:
         folder = os.path.join(os.path.expanduser("~"), "EzCopy Logs")
         os.makedirs(folder, exist_ok=True)
         path = os.path.join(folder, time.strftime("ezcopy-%Y%m%d-%H%M%S.txt"))
         with open(path, "w", encoding="utf-8") as f:
-            f.write(f"EzCopy {time.ctime()}\ndest: {dest}\nverify: {verify}\ndrives: {rep.drives}\n")
-            f.write(f"copied: {rep.copied}  skipped: {rep.skipped}  failed: {len(rep.failed)}  cancelled: {rep.cancelled}"
+            f.write(f"EzCopy {rep.kind} {time.ctime()}\ndest: {dest}\nverify: {verify}\ndrives: {rep.drives}\n")
+            f.write(f"{'matching' if rep.kind == 'check' else 'copied'}: {rep.copied}  skipped: {rep.skipped}  "
+                    f"failed: {len(rep.failed)}  cancelled: {rep.cancelled}"
                     f"  time: {fmt_time(rep.seconds)}\n")
             for p, why in rep.failed:
                 f.write(f"FAILED  {p}  ({why})\n")
@@ -547,7 +671,10 @@ def fmt_time(s):
 
 
 def summary(rep):
-    head = "CANCELLED" if rep.cancelled else ("ALL COPIED AND VERIFIED" if rep.ok else "FINISHED WITH ERRORS")
+    if rep.kind == "check":
+        head = "CANCELLED" if rep.cancelled else ("ALL FILES MATCH THE SOURCE" if rep.ok else "PROBLEMS FOUND")
+        return f"{head}: {rep.copied} match ({fmt_size(rep.bytes)}), {len(rep.failed)} missing or different, in {fmt_time(rep.seconds)}"
+    head ="CANCELLED" if rep.cancelled else ("ALL COPIED AND VERIFIED" if rep.ok else "FINISHED WITH ERRORS")
     return (f"{head}: {rep.copied} copied ({fmt_size(rep.bytes)}), {rep.skipped} already there, "
             f"{len(rep.failed)} failed, in {fmt_time(rep.seconds)}"
             + (f" ({fmt_size(rep.bytes / rep.seconds)}/s)" if rep.seconds > 0.5 and rep.bytes else ""))
@@ -874,6 +1001,9 @@ def cli(argv):
     ap.add_argument("--no-verify", action="store_true")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--drives", choices=("auto", "hdd", "ssd"), default="auto")
+    ap.add_argument("--replace", action="store_true", help="overwrite files already at DEST that differ (default: report a conflict, change nothing)")
+    ap.add_argument("--compare", action="store_true", help="also compare contents of files already at DEST that look identical (slower)")
+    ap.add_argument("--check", action="store_true", help="copy nothing: compare DEST with SRC byte for byte and report")
     ap.add_argument("--speedtest", action="store_true",
                     help="measure the drives and the processor and say how fast a copy can go; copies nothing")
     a = ap.parse_args(argv)
@@ -901,7 +1031,12 @@ def cli(argv):
                       f"{fmt_size(speed)}/s  about {fmt_time(eta)} left   ", end="", flush=True)
     threading.Thread(target=printer, daemon=True).start()
     try:
-        rep = run(a.paths[:-1], a.paths[-1], not a.no_verify, a.workers, lambda p: holder.update(p=p), drives=a.drives)
+        cb = lambda p: holder.update(p=p)
+        if a.check:
+            rep = check(a.paths[:-1], a.paths[-1], a.workers, cb, drives=a.drives)
+        else:
+            rep = run(a.paths[:-1], a.paths[-1], not a.no_verify, a.workers, cb, drives=a.drives,
+                      replace=a.replace, compare=a.compare)
     except (EzCopyError, OSError) as e:
         done.set()
         print(f"\nERROR: {e}")
@@ -970,6 +1105,12 @@ def gui():
     opt.pack(fill="x", **pad)
     verify = tk.BooleanVar(value=True)
     ttk.Checkbutton(opt, text="Verify every file after copying (recommended)", variable=verify).pack(side="left")
+    opt3 = ttk.Frame(root)
+    opt3.pack(fill="x", padx=10)
+    replace = tk.BooleanVar(value=False)
+    compare = tk.BooleanVar(value=False)
+    ttk.Checkbutton(opt3, text="Replace files already there that differ", variable=replace).pack(side="left")
+    ttk.Checkbutton(opt3, text="Compare contents of files already there", variable=compare).pack(side="left", padx=12)
     opt2 = ttk.Frame(root)
     opt2.pack(fill="x", **pad)
     ttk.Label(opt2, text="Drives:").pack(side="left")
@@ -983,6 +1124,8 @@ def gui():
     brow.pack(fill="x", padx=10, pady=6)
     go = ttk.Button(brow, text="START COPY")
     go.pack(side="left", fill="x", expand=True)
+    cbtn = ttk.Button(brow, text="Check copy")
+    cbtn.pack(side="left", padx=(6, 0))
     tbtn = ttk.Button(brow, text="Speed test")
     tbtn.pack(side="left", padx=(6, 0))
     bar = ttk.Progressbar(root, maximum=100)
@@ -999,9 +1142,13 @@ def gui():
         log.see("end")
         log.configure(state="disabled")
 
-    def work(srcs, dst, ver, n, drv):   # runs off the main thread: must not touch Tk variables
+    def work(kind, srcs, dst, ver, n, drv, rpl, cmp_):   # runs off the main thread: must not touch Tk variables
         try:
-            state["rep"] = run(srcs, dst, ver, n, lambda p: state.update(prog=p), state["cancel"], drv)
+            cb = lambda p: state.update(prog=p)
+            if kind == "check":
+                state["rep"] = check(srcs, dst, n, cb, state["cancel"], drv)
+            else:
+                state["rep"] = run(srcs, dst, ver, n, cb, state["cancel"], drv, rpl, cmp_)
         except Exception as e:
             state["err"] = e
 
@@ -1010,13 +1157,15 @@ def gui():
         if p:
             speed, eta = speedo.read(p)
             bar["value"] = 100 * p.work / max(p.total, 1)
-            status.set(f"{'Copying + verifying' if verify.get() else 'Copying'} ({p.mode}): "
+            what = "Checking" if p.mode == "check" else ("Copying + verifying" if verify.get() else "Copying")
+            status.set(f"{what} ({p.mode}): "
                        f"{p.files}/{p.total_files} files   {fmt_size(speed)}/s   about {fmt_time(eta)} left")
         if thread.is_alive():
             root.after(250, poll)
             return
         go.configure(text="START COPY", command=start)
         tbtn.state(["!disabled"])
+        cbtn.state(["!disabled"])
         if state["err"]:
             status.set("Could not start.")
             messagebox.showerror("EzCopy", str(state["err"]))
@@ -1033,7 +1182,7 @@ def gui():
             say(f"Log with checksums: {rep.log}")
         (messagebox.showinfo if rep.ok else messagebox.showwarning)("EzCopy", summary(rep))
 
-    def start():
+    def start(kind="copy"):
         nonlocal thread, speedo
         if not sources or not dest.get().strip():
             messagebox.showinfo("EzCopy", "Add something to copy and choose a destination first.")
@@ -1046,11 +1195,13 @@ def gui():
             n = max(1, workers.get())
         except tk.TclError:
             n = 8
-        thread = threading.Thread(target=work, args=(list(sources), dest.get().strip(), verify.get(), n,
-                                                     DRIVE_CHOICES.get(drives.get(), "auto")), daemon=True)
+        thread = threading.Thread(target=work, args=(kind, list(sources), dest.get().strip(), verify.get(), n,
+                                                     DRIVE_CHOICES.get(drives.get(), "auto"),
+                                                     replace.get(), compare.get()), daemon=True)
         thread.start()
         go.configure(text="CANCEL", command=state["cancel"].set)
         tbtn.state(["disabled"])
+        cbtn.state(["disabled"])
         poll()
 
     def test_work(srcs, dst, ver, drv):   # off the main thread, like work()
@@ -1069,6 +1220,7 @@ def gui():
             return
         tbtn.configure(text="Speed test", command=start_test)
         go.state(["!disabled"])
+        cbtn.state(["!disabled"])
         err = state["err"]
         if isinstance(err, Cancelled):
             status.set("Speed test cancelled.")
@@ -1094,11 +1246,13 @@ def gui():
                                                           DRIVE_CHOICES.get(drives.get(), "auto")), daemon=True)
         thread.start()
         go.state(["disabled"])
+        cbtn.state(["disabled"])
         tbtn.configure(text="Cancel test", command=state["cancel"].set)
         poll_test()
 
     thread = threading.Thread()
     go.configure(command=start)
+    cbtn.configure(command=lambda: start("check"))
     tbtn.configure(command=start_test)
     root.mainloop()
 

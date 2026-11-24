@@ -6,10 +6,23 @@ copied file and compares a SHA-256 checksum with the source** before it gets its
 - Window: open the app, add files/folders, choose destination, START COPY.
 - Command line: `python3 ezcopy.py SRC [SRC ...] DEST` (exit code 1 if any file failed).
   Options: `--drives auto|hdd|ssd`, `--workers N` (parallel small files), `--no-verify`,
-  `--speedtest` (measure only, copy nothing).
+  `--speedtest` (measure only, copy nothing), `--check` (compare only), `--replace`, `--compare`.
 - Every run writes a log with the checksum of each file to `~/EzCopy Logs/`.
 - Run it again on the same folders to resume: files already copied (same size + time) are skipped.
 - Self-test (includes simulated corruption): `python3 test_ezcopy.py`
+
+## Nothing is ever overwritten or lost silently
+- **Same name from two places** (two cards both holding `IMG_0001.JPG`, or `a.txt` and `A.TXT`) copied into
+  one folder: both are kept, the later one is saved as `IMG_0001 (2).JPG`, and the log says so.
+- **A different file is already at the destination:** it is left untouched and reported as a CONFLICT (the
+  run ends with errors). Tick **Replace files already there that differ** (`--replace`) to overwrite them.
+- **Resume** trusts "same size and same time" (fast). That can be fooled by a file changed without changing
+  its size or time, so tick **Compare contents of files already there** (`--compare`) to hash both copies
+  (slower: it reads every such file twice).
+- **Check copy** (`--check`) copies nothing: it compares the destination with the source, byte for byte
+  (SHA-256 of both), and lists anything missing or different. Run it after unplugging and replugging the
+  destination, and it reads the real disk, not memory: the strongest proof a copy is intact.
+- Leftover `*.ezcopy-part` files appear only if a copy was interrupted (crash, power loss). They are safe to delete.
 
 ## Install
 - **Mac (Apple Silicon):** unzip `EzCopy-mac-AppleSilicon.zip`, drag EzCopy.app to Applications.
@@ -66,4 +79,10 @@ What EzCopy does to reach that limit:
   stored the bytes correctly. A file too big to stay in memory (a long video) is read back from the disk
   itself; that file then takes up to twice as long.
 - Symlinks are skipped (listed in the log). Permissions/Finder tags/extended attributes are not copied; timestamps are.
-- The Windows build is untested by the author.
+- It does not know card types (SD, CFexpress, ...); it measures what a drive actually delivers (Speed test)
+  and treats hard disks differently from everything else, which is the only distinction that changes how to copy.
+- Linux is not supported (no Linux drive detection or build).
+- On a fast SSD (4 GB file, internal drive) EzCopy matched the system `cp` (about 250-390 MB/s each,
+  verify on or off); run-to-run swings of that SSD were larger than the difference between the tools.
+  So the copy engine is not what limits speed on that hardware; the drive is.
+- The Windows build passes the self-test on Windows (GitHub Actions), but the author has not run the app by hand there.
